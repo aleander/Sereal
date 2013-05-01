@@ -179,4 +179,22 @@ srl_buf_cat_zigzag(pTHX_ srl_encoder_t *enc, const char tag, const IV n) {
     srl_buf_cat_varint(aTHX_ enc, tag, z);
 }
 
+SRL_STATIC_INLINE STRLEN
+srl_buf_cat_maxsize_varint_nocheck(pTHX_ srl_encoder_t *enc)
+{
+    const STRLEN rv = BUF_POS_OFS(enc);
+    enc->pos += SRL_MAX_VARINT_LENGTH; /* skip ahead */
+    return rv;
+}
+
+SRL_STATIC_INLINE STRLEN
+srl_buf_cat_maxsize_varint(pTHX_ srl_encoder_t *enc)
+{
+    const STRLEN rv = BUF_POS_OFS(enc);
+    BUF_SIZE_ASSERT(enc, SRL_MAX_VARINT_LENGTH);
+    enc->pos += SRL_MAX_VARINT_LENGTH; /* skip ahead */
+    return rv;
+}
+
+
 #endif

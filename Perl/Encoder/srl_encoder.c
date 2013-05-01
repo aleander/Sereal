@@ -95,6 +95,9 @@ SRL_STATIC_INLINE PTABLE_t *srl_init_ref_hash(srl_encoder_t *enc);
 SRL_STATIC_INLINE PTABLE_t *srl_init_weak_hash(srl_encoder_t *enc);
 SRL_STATIC_INLINE HV *srl_init_string_deduper_hv(pTHX_ srl_encoder_t *enc);
 
+SRL_STATIC_INLINE void srl_update_varint_from_to(pTHX_ char *varint_start, STRLEN length, UV number);
+SRL_STATIC_INLINE void srl_update_varint_from(pTHX_ char * const varint_start, const UV number);
+
 #define SRL_GET_STR_DEDUPER_HV(enc) ( (enc)->string_deduper_hv == NULL     \
                                     ? srl_init_string_deduper_hv(aTHX_ enc)     \
                                    : (enc)->string_deduper_hv )
@@ -377,8 +380,20 @@ srl_init_snappy_workmem(pTHX_ srl_encoder_t *enc)
 }
 
 
+#undef BYTESWAP_U32
+#if (BYTEORDER == 0x1234 || BYTEORDER == 0x12345678)     /* little endian */
+    #define BYTESWAP_U32(x) (x)     /* no-op */
+
+#elif (BYTEORDER == 0x4321 || BYTEORDER == 0x87654321)   /* big endian */
+    #define BYTESWAP_U32(x) ((((x)&0xFF)<<24)       \
+                            |(((x)>>24)&0xFF)       \
+                            |(((x)&0x0000FF00)<<8)  \
+                            |(((x)&0x00FF0000)>>8)  )
+#endif
+
+
 void
-srl_write_header(pTHX_ srl_encoder_t *enc)
+srl_write_header(pTHX_ srl_encoder_t *enc, SV *user_header_src)
 {
     /* 4th to 8th bit are flags. Using 4th for snappy flag. FIXME needs to go in spec. */
     const U8 version_and_flags = SRL_PROTOCOL_VERSION
@@ -390,13 +405,38 @@ srl_write_header(pTHX_ srl_encoder_t *enc)
                                     : SRL_PROTOCOL_ENCODING_RAW
                                  );
 
-    /* 4 byte magic string + proto version
-     * + potentially uncompressed size varint
-     * +  1 byte varint that indicates zero-length header */
-    BUF_SIZE_ASSERT(enc, sizeof(SRL_MAGIC_STRING) + 1 + 1);
-    srl_buf_cat_str_s_nocheck(enc, SRL_MAGIC_STRING);
-    srl_buf_cat_char_nocheck(enc, version_and_flags);
-    srl_buf_cat_char_nocheck(enc, '\0'); /* variable header length (0 right now) */
+    if (user_header_src == NULL) {
+        /* 4 byte magic string + proto version
+         * +  1 byte varint that indicates zero-length header */
+        BUF_SIZE_ASSERT(enc, sizeof(SRL_MAGIC_STRING)+1 + 1);
+        srl_buf_cat_str_s_nocheck(enc, SRL_MAGIC_STRING);
+        srl_buf_cat_char_nocheck(enc, version_and_flags);
+        /* variable header length is 0 without user data right now */
+        srl_buf_cat_char_nocheck(enc, '\0');
+    }
+    else {
+        STRLEN header_len_pos, user_data_header_len_pos;
+        uint32_t user_data_dump_len;
+        char *tmp;
+        /* 4 byte magic string + proto version
+         * + varint that indicates header-length
+         * + header (8bit bit-field + length-data-length + user data dump) */
+        BUF_SIZE_ASSERT(enc, sizeof(SRL_MAGIC_STRING)+1 + SRL_MAX_VARINT_LENGTH
+                             + 2 + SRL_MAX_VARINT_LENGTH);
+        srl_buf_cat_str_s_nocheck(enc, SRL_MAGIC_STRING);
+        srl_buf_cat_char_nocheck(enc, version_and_flags);
+        header_len_pos = srl_buf_cat_maxsize_varint_nocheck(aTHX_ enc); /* header length template */
+        srl_buf_cat_char_nocheck(enc, '\1'); /* bit field with the user data bit set, little endian */
+
+        user_data_header_len_pos = BUF_POS_OFS(enc);
+        srl_buf_cat_str_s_nocheck(enc, "\0\0\0\0");
+        srl_dump_sv(aTHX_ enc, user_header_src);
+        user_data_dump_len = (uint32_t)(BUF_POS_OFS(enc) - user_data_header_len_pos - 4 + 1);
+        tmp = enc->buf_start + user_data_header_len_pos;
+        *((uint32_t*)tmp) = BYTESWAP_U32(user_data_dump_len);
+
+        srl_update_varint_from(aTHX_ (enc->buf_start + header_len_pos), (BUF_POS_OFS(enc) - header_len_pos - SRL_MAX_VARINT_LENGTH + 1));
+    }
 }
 
 /* The following is to handle the fact that under normal build options
@@ -555,8 +595,10 @@ srl_prepare_encoder(pTHX_ srl_encoder_t *enc)
  * positions. This can produce non-canonical varints and is useful for filling
  * pre-allocated varints. */
 SRL_STATIC_INLINE void
-srl_update_varint_from_to(pTHX_ char *varint_start, char *varint_end, UV number)
+srl_update_varint_from_to(pTHX_ char *varint_start, STRLEN length, UV number)
 {
+    char * const varint_end = varint_start + length;
+
     while (number >= 0x80) {                      /* while we are larger than 7 bits long */
         *varint_start++ = (number & 0x7f) | 0x80; /* write out the least significant 7 bits, set the high bit */
         number = number >> 7;                     /* shift off the 7 least significant bits */
@@ -578,6 +620,12 @@ srl_update_varint_from_to(pTHX_ char *varint_start, char *varint_end, UV number)
     }
 }
 
+SRL_STATIC_INLINE void
+srl_update_varint_from(pTHX_ char * const varint_start, const UV number)
+{
+    srl_update_varint_from_to(aTHX_ varint_start, SRL_MAX_VARINT_LENGTH, number);
+}
+
 
 /* Resets the Snappy-compression header flag to OFF.
  * Obviously requires that a Sereal header was already written to the
@@ -593,12 +641,12 @@ srl_reset_snappy_header_flag(srl_encoder_t *enc)
 }
 
 void
-srl_dump_data_structure(pTHX_ srl_encoder_t *enc, SV *src)
+srl_dump_data_structure(pTHX_ srl_encoder_t *enc, SV *src, SV *user_header_src)
 {
     enc = srl_prepare_encoder(aTHX_ enc);
 
     if (!SRL_ENC_HAVE_OPTION(enc, (SRL_F_COMPRESS_SNAPPY | SRL_F_COMPRESS_SNAPPY_INCREMENTAL))) {
-        srl_write_header(aTHX_ enc);
+        srl_write_header(aTHX_ enc, user_header_src);
         srl_dump_sv(aTHX_ enc, src);
         srl_fixup_weakrefs(aTHX_ enc);
     }
@@ -608,7 +656,7 @@ srl_dump_data_structure(pTHX_ srl_encoder_t *enc, SV *src)
 
         /* Alas, have to write entire packet first since the header length
          * will determine offsets. */
-        srl_write_header(aTHX_ enc);
+        srl_write_header(aTHX_ enc, user_header_src);
         sereal_header_len = BUF_POS_OFS(enc);
         srl_dump_sv(aTHX_ enc, src);
         srl_fixup_weakrefs(aTHX_ enc);
@@ -624,7 +672,7 @@ srl_dump_data_structure(pTHX_ srl_encoder_t *enc, SV *src)
         else { /* do snappy compression of body */
             char *old_buf;
             char *varint_start= NULL;
-            char *varint_end;
+            STRLEN varint_len;
             uint32_t dest_len;
 
             /* Get uncompressed payload and total packet output (after compression) lengths */
@@ -654,7 +702,7 @@ srl_dump_data_structure(pTHX_ srl_encoder_t *enc, SV *src)
             if ( SRL_ENC_HAVE_OPTION(enc, SRL_F_COMPRESS_SNAPPY_INCREMENTAL ) ) {
                 varint_start= enc->pos;
                 srl_buf_cat_varint_nocheck(aTHX_ enc, 0, dest_len);
-                varint_end= enc->pos - 1;
+                varint_len = (enc->pos - varint_start - 1);
             }
 
             csnappy_compress(old_buf+sereal_header_len, (uint32_t)uncompressed_body_length, enc->pos, &dest_len,
@@ -663,7 +711,7 @@ srl_dump_data_structure(pTHX_ srl_encoder_t *enc, SV *src)
 
             /* overwrite the max size varint with the real size of the compressed data */
             if (varint_start)
-                srl_update_varint_from_to(aTHX_ varint_start, varint_end, dest_len);
+                srl_update_varint_from_to(aTHX_ varint_start, varint_len, dest_len);
 
             Safefree(old_buf);
             enc->pos += dest_len;
@@ -715,7 +763,7 @@ srl_fixup_weakrefs(pTHX_ srl_encoder_t *enc)
 #    define RX_PRECOMP(re) ((re)->precomp)
 #    define RX_PRELEN(re) ((re)->prelen)
 
-// Maybe this is only on OS X, where SvUTF8(sv) exists but looks at flags that don't exist
+/* Maybe this is only on OS X, where SvUTF8(sv) exists but looks at flags that don't exist */
 #    define RX_UTF8(re) (RX_EXTFLAGS(re) & RXf_UTF8)
 
 #elif defined(SvRX)
@@ -1024,7 +1072,7 @@ SRL_STATIC_INLINE void
 srl_dump_svpv(pTHX_ srl_encoder_t *enc, SV *src)
 {
     STRLEN len;
-    const char const *str= SvPV(src, len);
+    char const *str= SvPV(src, len);
     if ( SRL_ENC_HAVE_OPTION(enc, SRL_F_DEDUPE_STRINGS) && len > 3 ) {
         HV *string_deduper_hv= SRL_GET_STR_DEDUPER_HV(enc);
         HE *dupe_offset_he= hv_fetch_ent(string_deduper_hv, src, 1, 0);
@@ -1085,8 +1133,8 @@ srl_dump_sv(pTHX_ srl_encoder_t *enc, SV *src)
     SV* refsv= NULL;
     UV weakref_ofs= 0;              /* preserved between loops */
     SSize_t ref_rewrite_pos= 0;      /* preserved between loops - note SSize_t is a perl define */
-    assert(src);
     int nobless = SRL_ENC_HAVE_OPTION(enc, SRL_F_NO_BLESS_OBJECTS);
+    assert(src);
 
     if (++enc->recursion_depth == enc->max_recursion_depth) {
         croak("Hit maximum recursion depth (%lu), aborting serialization",
